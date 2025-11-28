@@ -41,3 +41,5 @@ lto = true
 [profile.dev.package."*"]
 opt-level = 3
 
+[patch.crates-io]
+casper-types = { git = "https://github.com/casper-network/casper-node", rev = "991a42d" }
