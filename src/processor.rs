@@ -3,7 +3,7 @@
 
 use odra::prelude::*;
 use odra::casper_types::U256;
-use odra::macros::{CLTyped, FromBytes, ToBytes};
+use odra::{macros::{CLTyped, FromBytes, ToBytes, OdraSchema}};
 
 // Local imports
 use crate::error::LendingError;
@@ -799,7 +799,7 @@ impl NovaLending {
 // SUPPORTING STRUCTS AND IMPLEMENTATIONS
 // ===========================================================================
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct Reserve {
     pub lending_market: Address,
     pub liquidity: ReserveLiquidity,
@@ -923,7 +923,7 @@ impl Reserve {
     }
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct Obligation {
     pub lending_market: Address,
     pub owner: Address,
@@ -1131,7 +1131,7 @@ impl Liquidity {
 // PARAMETER STRUCTS
 // ===========================================================================
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct InitReserveParams {
     pub current_slot: u64,
     pub lending_market: Address,
@@ -1140,7 +1140,7 @@ pub struct InitReserveParams {
     pub config: ReserveConfig,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct InitObligationParams {
     pub current_slot: u64,
     pub lending_market: Address,
@@ -1149,7 +1149,7 @@ pub struct InitObligationParams {
     pub borrows: Vec<Liquidity>,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct NewReserveLiquidityParams {
     pub mint_pubkey: Address,
     pub mint_decimals: u8,
@@ -1162,14 +1162,14 @@ pub struct NewReserveLiquidityParams {
     pub cumulative_borrow_rate_wads: Decimal,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct NewReserveCollateralParams {
     pub mint_pubkey: Address,
     pub supply_pubkey: Address,
     pub mint_total_supply: U256,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct ReserveConfig {
     pub loan_to_value_ratio: u8,
     pub liquidation_threshold: u8,
@@ -1192,7 +1192,7 @@ impl ReserveConfig {
     }
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct ReserveFees {
     pub borrow_fee_wad: U256,
     pub flash_loan_fee_wad: U256,
@@ -1208,7 +1208,7 @@ impl ReserveFees {
     }
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct ReserveLiquidity {
     pub mint_pubkey: Address,
     pub mint_decimals: u8,
@@ -1281,7 +1281,7 @@ impl ReserveLiquidity {
     }
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct ReserveCollateral {
     pub mint_pubkey: Address,
     pub supply_pubkey: Address,
@@ -1315,7 +1315,7 @@ impl ReserveCollateral {
 // RESULT STRUCTS
 // ===========================================================================
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct CalculateBorrowResult {
     pub borrow_amount: Decimal,
     pub receive_amount: U256,
@@ -1323,13 +1323,13 @@ pub struct CalculateBorrowResult {
     pub host_fee: U256,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct CalculateRepayResult {
     pub settle_amount: Decimal,
     pub repay_amount: U256,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct CalculateLiquidationResult {
     pub settle_amount: Decimal,
     pub repay_amount: U256,
