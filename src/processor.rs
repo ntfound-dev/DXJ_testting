@@ -3,18 +3,17 @@
 
 use odra::prelude::*;
 use odra::casper_types::U256;
-use odra::{macros::{CLTyped, FromBytes, ToBytes, OdraSchema}};
+use odra::casper_types::{U256, CLTyped};
+use odra::prelude::BTreeMap;
+use odra::schema::{CustomType, NamedCLTyped, SchemaCustomTypes};
+use odra::macros::{FromBytes, ToBytes, OdraSchema, CLTyped};
+use crate::math::{TryAdd, TrySub, TryMul, TryDiv};
 
-// Local imports
 use crate::error::LendingError;
 use crate::math::{
-    common::{TryAdd, TrySub},
+    common::{TryAdd, TryDiv, TryMul, TrySub},
     Decimal, Rate
 };
-
-// Import the math traits
-use crate::math::TryDiv as MathTryDiv;
-use crate::math::TryMul as MathTryMul;
 
 #[odra::module]
 pub struct NovaLending {
@@ -823,28 +822,31 @@ impl Reserve {
     }
     
     pub fn deposit_liquidity(&mut self, amount: U256) -> Result<U256, LendingError> {
-        // Calculate collateral amount based on exchange rate
         let exchange_rate = self.collateral_exchange_rate()?;
-        let collateral_amount = exchange_rate.try_mul(Decimal::from(amount.as_u128()))?.try_floor_u64()?;
-        
+        let collateral_amount = exchange_rate
+            .try_mul(Decimal::from(amount.as_u128()))?
+            .try_floor_u64()?;
+
         self.liquidity.deposit(amount)?;
-        self.collateral.mint(collateral_amount)?;
-        
-        Ok(collateral_amount)
+        self.collateral.mint(collateral_amount.into())?;
+
+        Ok(collateral_amount.into())
     }
     
     pub fn redeem_collateral(&mut self, amount: U256) -> Result<U256, LendingError> {
         let exchange_rate = self.collateral_exchange_rate()?;
-        let liquidity_amount = Decimal::from(amount.as_u128()).try_div(exchange_rate)?.try_floor_u64()?;
-        
-        if liquidity_amount > self.liquidity.available_amount {
+        let liquidity_amount = Decimal::from(amount.as_u128())
+            .try_div(exchange_rate)?
+            .try_floor_u64()?;
+
+        if liquidity_amount > self.liquidity.available_amount.as_u64() {
             return Err(LendingError::InsufficientLiquidity);
         }
-        
+
         self.collateral.burn(amount)?;
-        self.liquidity.withdraw(liquidity_amount)?;
-        
-        Ok(liquidity_amount)
+        self.liquidity.withdraw(liquidity_amount.into())?;
+
+        Ok(liquidity_amount.into())
     }
     
     pub fn accrue_interest(&mut self, _slot: u64) -> Result<(), LendingError> {
@@ -853,39 +855,47 @@ impl Reserve {
         Ok(())
     }
     
-    pub fn calculate_borrow(&self, amount: U256, remaining: Decimal) -> Result<CalculateBorrowResult, LendingError> {
+    pub fn calculate_borrow(
+        &self,
+        amount: U256,
+        remaining: Decimal
+    ) -> Result<CalculateBorrowResult, LendingError> {
         let remaining_u64 = remaining.try_floor_u64()?;
-        let borrow_amount = if amount == U256::max_value() {
-            remaining_u64
+        let borrow_amount: U256 = if amount == U256::max_value() {
+            remaining_u64.into()
         } else {
             U256::min(amount, remaining_u64.into())
         };
-        
+
         let borrow_fee = borrow_amount / 100; // 1% borrow fee
         let host_fee = borrow_fee / 10; // 10% of borrow fee to host
         let receive_amount = borrow_amount - borrow_fee;
-        
+
         Ok(CalculateBorrowResult {
             borrow_amount: Decimal::from(borrow_amount.as_u128()),
             receive_amount,
             borrow_fee,
-            host_fee,
+            host_fee
         })
     }
     
-    pub fn calculate_repay(&self, amount: U256, borrowed: Decimal) -> Result<CalculateRepayResult, LendingError> {
+    pub fn calculate_repay(
+        &self,
+        amount: U256,
+        borrowed: Decimal
+    ) -> Result<CalculateRepayResult, LendingError> {
         let borrowed_u256 = borrowed.try_floor_u64()?;
-        let repay_amount = if amount == U256::max_value() {
-            borrowed_u256
+        let repay_amount: U256 = if amount == U256::max_value() {
+            borrowed_u256.into()
         } else {
             U256::min(amount, borrowed_u256.into())
         };
-        
+
         let settle_amount = Decimal::from(repay_amount.as_u128());
-        
+
         Ok(CalculateRepayResult {
             settle_amount,
-            repay_amount,
+            repay_amount
         })
     }
     
@@ -905,11 +915,11 @@ impl Reserve {
         
         let repay_amount = repay_value.try_floor_u64()?;
         let withdraw_amount = withdraw_value.try_div(collateral.market_value)?.try_floor_u64()?;
-        
+
         Ok(CalculateLiquidationResult {
             settle_amount: repay_value,
-            repay_amount,
-            withdraw_amount,
+            repay_amount: repay_amount.into(),
+            withdraw_amount: withdraw_amount.into()
         })
     }
     
@@ -985,20 +995,26 @@ impl Obligation {
         Err(LendingError::ObligationCollateralEmpty)
     }
     
-    pub fn find_or_add_liquidity_to_borrows(&mut self, reserve: Address) -> Result<&mut Liquidity, LendingError> {
-        if let Some(liquidity) = self.borrows.iter_mut().find(|l| l.borrow_reserve == reserve) {
-            return Ok(liquidity);
+    pub fn find_or_add_liquidity_to_borrows(
+        &mut self,
+        reserve: Address
+    ) -> Result<&mut Liquidity, LendingError> {
+        let has_liquidity = self.borrows.iter().any(|l| l.borrow_reserve == reserve);
+
+        if !has_liquidity {
+            // Add new liquidity
+            self.borrows.push(Liquidity {
+                borrow_reserve: reserve,
+                borrowed_amount_wads: Decimal::zero(),
+                market_value: Decimal::zero(),
+                cumulative_borrow_rate_wads: Decimal::one()
+            });
         }
-        
-        // Add new liquidity
-        self.borrows.push(Liquidity {
-            borrow_reserve: reserve,
-            borrowed_amount_wads: Decimal::zero(),
-            market_value: Decimal::zero(),
-            cumulative_borrow_rate_wads: Decimal::one(),
-        });
-        
-        Ok(self.borrows.last_mut().unwrap())
+
+        Ok(self.borrows
+            .iter_mut()
+            .find(|l| l.borrow_reserve == reserve)
+            .unwrap())
     }
     
     pub fn find_liquidity_in_borrows(&self, reserve: Address) -> Result<(Liquidity, usize), LendingError> {
@@ -1101,6 +1117,12 @@ impl Collateral {
     pub fn deposit(&mut self, amount: U256) -> Result<(), LendingError> {
         self.deposited_amount = self.deposited_amount.try_add(amount)?;
         Ok(())
+    }
+}
+
+impl SchemaCustomTypes for LendingError {
+    fn schema_custom_types() -> BTreeMap<String, odra::schema::casper_contract_schema::CustomType> {
+        BTreeMap::new()
     }
 }
 
@@ -1250,7 +1272,7 @@ impl ReserveLiquidity {
     }
 
     pub fn borrow(&mut self, amount: Decimal) -> Result<(), LendingError> {
-        let amount_u256 = amount.try_floor_u64()?;
+        let amount_u256: U256 = amount.try_floor_u64()?.into();
         if amount_u256 > self.available_amount {
             return Err(LendingError::InsufficientLiquidity);
         }
