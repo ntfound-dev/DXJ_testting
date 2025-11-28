@@ -1,0 +1,131 @@
+//! Decimal type for fixed‑point math using U256
+
+use {
+    crate::error::LendingError,
+    odra::casper_types::U256,
+    std::fmt,
+};
+
+/// Decimal represented as scaled U256
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd, Eq, Ord)]
+pub struct Decimal(pub U256);
+
+/* -------------------------------------------------------------------------- */
+/*                        Casper Serialization (Required)                     */
+/* -------------------------------------------------------------------------- */
+impl odra::casper_types::bytesrepr::ToBytes for Decimal {
+    fn to_bytes(&self) -> Result<Vec<u8>, odra::casper_types::bytesrepr::Error> {
+        self.0.to_bytes()
+    }
+
+    fn serialized_length(&self) -> usize {
+        self.0.serialized_length()
+    }
+}
+
+impl odra::casper_types::bytesrepr::FromBytes for Decimal {
+    fn from_bytes(bytes: &[u8]) -> Result<(Self, &[u8]), odra::casper_types::bytesrepr::Error> {
+        let (value, remainder) = U256::from_bytes(bytes)?;
+        Ok((Decimal(value), remainder))
+    }
+}
+
+impl odra::casper_types::CLTyped for Decimal {
+    fn cl_type() -> odra::casper_types::CLType {
+        odra::casper_types::CLType::U256
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                               Decimal Logic                                */
+/* -------------------------------------------------------------------------- */
+impl Decimal {
+    pub fn zero() -> Self { Self(U256::zero()) }
+    pub fn one() -> Self { Self(U256::from(crate::math::common::WAD)) }
+
+    pub fn from_scaled_val(val: u128) -> Self {
+        Self(U256::from(val))
+    }
+
+    pub fn to_scaled_val(&self) -> u128 {
+        self.0.as_u128()
+    }
+}
+
+impl fmt::Display for Decimal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = self.0.to_string();
+        let scale = crate::math::common::SCALE;
+        if s.len() <= scale {
+            let padded = format!("0.{:0>width$}", s, width = scale);
+            return write!(f, "{}", padded);
+        }
+        let (i, d) = s.split_at(s.len() - scale);
+        write!(f, "{}.{}", i, d)
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                        Arithmetic Traits (Try*)                             */
+/* -------------------------------------------------------------------------- */
+impl crate::math::TryAdd for Decimal {
+    fn try_add(self, rhs: Self) -> Result<Self, LendingError> {
+        Ok(Self(self.0.checked_add(rhs.0).ok_or(LendingError::MathOverflow)?))
+    }
+}
+
+impl crate::math::TrySub for Decimal {
+    fn try_sub(self, rhs: Self) -> Result<Self, LendingError> {
+        Ok(Self(self.0.checked_sub(rhs.0).ok_or(LendingError::MathOverflow)?))
+    }
+}
+
+impl crate::math::TryMul<u64> for Decimal {
+    fn try_mul(self, rhs: u64) -> Result<Self, LendingError> {
+        Ok(Self(self.0.checked_mul(U256::from(rhs)).ok_or(LendingError::MathOverflow)?))
+    }
+}
+
+impl crate::math::TryMul<Decimal> for Decimal {
+    fn try_mul(self, rhs: Self) -> Result<Self, LendingError> {
+        Ok(Self(
+            self.0
+                .checked_mul(rhs.0)
+                .ok_or(LendingError::MathOverflow)?
+                .checked_div(U256::from(crate::math::common::WAD))
+                .ok_or(LendingError::MathOverflow)?
+        ))
+    }
+}
+
+impl crate::math::TryDiv<u64> for Decimal {
+    fn try_div(self, rhs: u64) -> Result<Self, LendingError> {
+        Ok(Self(self.0.checked_div(U256::from(rhs)).ok_or(LendingError::MathOverflow)?))
+    }
+}
+
+impl crate::math::TryDiv<Decimal> for Decimal {
+    fn try_div(self, rhs: Self) -> Result<Self, LendingError> {
+        Ok(Self(
+            self.0
+                .checked_mul(U256::from(crate::math::common::WAD))
+                .ok_or(LendingError::MathOverflow)?
+                .checked_div(rhs.0)
+                .ok_or(LendingError::MathOverflow)?
+        ))
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/*                                   Tests                                    */
+/* -------------------------------------------------------------------------- */
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_decimal_basic() {
+        let d = Decimal::from_scaled_val(1_000_000_000_000_000_000);
+        assert_eq!(d.to_scaled_val(), 1_000_000_000_000_000_000);
+    }
+}

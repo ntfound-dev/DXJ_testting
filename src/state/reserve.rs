@@ -1,0 +1,498 @@
+// src/state/reserve.rs
+use odra::prelude::*;
+use crate::{
+    error::LendingError,
+    math::{Decimal, Rate, TryAdd, TryDiv, TryMul, TrySub},
+};
+
+/// Percentage of an obligation that can be repaid during each liquidation call
+pub const LIQUIDATION_CLOSE_FACTOR: u8 = 50;
+
+/// Obligation borrow amount that is small enough to close out
+pub const LIQUIDATION_CLOSE_AMOUNT: u64 = 2;
+
+const INITIAL_COLLATERAL_RATE: u128 = 1_000_000_000_000_000_000;
+const UNINITIALIZED_VERSION: u8 = 0;
+const PROGRAM_VERSION: u8 = 1;
+const SLOTS_PER_YEAR: u64 = 31_536_000;
+
+// -----------------------------
+// Storage types (Odra-serializable)
+// -----------------------------
+
+#[odra::odra_type]
+pub struct ReserveLiquidityStorage {
+    pub mint_pubkey: [u8; 32],
+    pub mint_decimals: u8,
+    pub supply_pubkey: [u8; 32],
+    pub fee_receiver: [u8; 32],
+    pub oracle_pubkey: [u8; 32],
+    pub available_amount: u64,
+    pub borrowed_amount_wads_scaled: (u64, u64), // (high, low) to represent u128
+    pub cumulative_borrow_rate_wads_scaled: (u64, u64),
+    pub market_price_scaled: (u64, u64),
+}
+
+impl Default for ReserveLiquidityStorage {
+    fn default() -> Self {
+        Self {
+            mint_pubkey: [0u8; 32],
+            mint_decimals: 0,
+            supply_pubkey: [0u8; 32],
+            fee_receiver: [0u8; 32],
+            oracle_pubkey: [0u8; 32],
+            available_amount: 0,
+            borrowed_amount_wads_scaled: u128_to_tuple(0),
+            cumulative_borrow_rate_wads_scaled: u128_to_tuple(Decimal::one().to_scaled_val()),
+            market_price_scaled: u128_to_tuple(0),
+        }
+    }
+}
+
+// Helper functions to convert between u128 and (u64, u64)
+fn u128_to_tuple(val: u128) -> (u64, u64) {
+    ((val >> 64) as u64, val as u64)
+}
+
+fn tuple_to_u128(tuple: (u64, u64)) -> u128 {
+    ((tuple.0 as u128) << 64) | (tuple.1 as u128)
+}
+
+impl ReserveLiquidityStorage {
+    pub fn borrowed_amount_wads(&self) -> Decimal { 
+        Decimal::from_scaled_val(tuple_to_u128(self.borrowed_amount_wads_scaled)) 
+    }
+    pub fn cumulative_borrow_rate_wads(&self) -> Decimal { 
+        Decimal::from_scaled_val(tuple_to_u128(self.cumulative_borrow_rate_wads_scaled)) 
+    }
+    pub fn market_price(&self) -> Decimal { 
+        Decimal::from_scaled_val(tuple_to_u128(self.market_price_scaled)) 
+    }
+
+    pub fn set_borrowed_amount_wads(&mut self, d: Decimal) { 
+        self.borrowed_amount_wads_scaled = u128_to_tuple(d.to_scaled_val()); 
+    }
+    pub fn set_cumulative_borrow_rate_wads(&mut self, d: Decimal) { 
+        self.cumulative_borrow_rate_wads_scaled = u128_to_tuple(d.to_scaled_val()); 
+    }
+    pub fn set_market_price(&mut self, d: Decimal) { 
+        self.market_price_scaled = u128_to_tuple(d.to_scaled_val()); 
+    }
+}
+
+#[odra::odra_type]
+pub struct ReserveCollateralStorage {
+    pub mint_pubkey: [u8; 32],
+    pub mint_total_supply: u64,
+    pub supply_pubkey: [u8; 32],
+}
+
+impl Default for ReserveCollateralStorage {
+    fn default() -> Self {
+        Self {
+            mint_pubkey: [0u8; 32],
+            mint_total_supply: 0,
+            supply_pubkey: [0u8; 32],
+        }
+    }
+}
+
+#[odra::odra_type]
+pub struct ReserveFeesStorage {
+    pub borrow_fee_wad: u64,
+    pub flash_loan_fee_wad: u64,
+    pub host_fee_percentage: u8,
+}
+
+impl Default for ReserveFeesStorage {
+    fn default() -> Self {
+        Self {
+            borrow_fee_wad: 0,
+            flash_loan_fee_wad: 0,
+            host_fee_percentage: 0,
+        }
+    }
+}
+
+#[odra::odra_type]
+pub struct ReserveConfigStorage {
+    pub optimal_utilization_rate: u8,
+    pub loan_to_value_ratio: u8,
+    pub liquidation_bonus: u8,
+    pub liquidation_threshold: u8,
+    pub min_borrow_rate: u8,
+    pub optimal_borrow_rate: u8,
+    pub max_borrow_rate: u8,
+    pub fees: ReserveFeesStorage,
+}
+
+impl Default for ReserveConfigStorage {
+    fn default() -> Self {
+        Self {
+            optimal_utilization_rate: 0,
+            loan_to_value_ratio: 0,
+            liquidation_bonus: 0,
+            liquidation_threshold: 0,
+            min_borrow_rate: 0,
+            optimal_borrow_rate: 0,
+            max_borrow_rate: 0,
+            fees: ReserveFeesStorage::default(),
+        }
+    }
+}
+
+#[odra::odra_type]
+pub struct LastUpdateStorage {
+    pub slot: u64,
+    pub stale: bool,
+}
+
+impl Default for LastUpdateStorage {
+    fn default() -> Self { 
+        Self { slot: 0, stale: true } 
+    }
+}
+
+// -----------------------------
+// Result types
+// -----------------------------
+
+#[odra::odra_type]
+pub struct CalculateBorrowResultStorage {
+    pub borrow_amount_scaled: (u64, u64), // u128 as tuple
+    pub receive_amount: u64,
+    pub borrow_fee: u64,
+    pub host_fee: u64,
+}
+
+#[odra::odra_type]
+pub struct CalculateRepayResultStorage {
+    pub settle_amount_scaled: (u64, u64), // u128 as tuple
+    pub repay_amount: u64,
+}
+
+// -----------------------------
+// Collateral exchange rate
+// -----------------------------
+
+#[derive(Clone, Debug)]
+pub struct CollateralExchangeRate(Rate);
+
+impl CollateralExchangeRate {
+    pub fn from_storage(coll: &ReserveCollateralStorage, liq: &ReserveLiquidityStorage) -> Self {
+        let rate = if coll.mint_total_supply == 0 || 
+            (liq.available_amount == 0 && tuple_to_u128(liq.borrowed_amount_wads_scaled) == 0) {
+            Rate::from_scaled_val(INITIAL_COLLATERAL_RATE)
+        } else {
+            let mint_total_supply = Decimal::from(coll.mint_total_supply);
+            let total_liquidity = Decimal::from(liq.available_amount)
+                .try_add(Decimal::from_scaled_val(tuple_to_u128(liq.borrowed_amount_wads_scaled)))
+                .unwrap_or(Decimal::zero());
+            
+            // FIXED: Use direct conversion instead of TryFrom
+            let rate_decimal = mint_total_supply.try_div(total_liquidity).unwrap_or(Decimal::zero());
+            Rate::from(rate_decimal) // Use From<Decimal> for Rate
+        };
+        CollateralExchangeRate(rate)
+    }
+
+    pub fn collateral_to_liquidity(&self, collateral_amount: u64) -> Result<u64, LendingError> {
+        self.decimal_collateral_to_liquidity(Decimal::from(collateral_amount))?
+            .try_floor_u64()
+            .map_err(|_| LendingError::MathOverflow)
+    }
+
+    pub fn decimal_collateral_to_liquidity(&self, collateral_amount: Decimal) -> Result<Decimal, LendingError> {
+        Ok(collateral_amount.try_div(self.0)?) // Uses TryDiv<Rate> for Decimal
+    }
+
+    pub fn liquidity_to_collateral(&self, liquidity_amount: u64) -> Result<u64, LendingError> {
+        self.decimal_liquidity_to_collateral(Decimal::from(liquidity_amount))?
+            .try_floor_u64()
+            .map_err(|_| LendingError::MathOverflow)
+    }
+
+    pub fn decimal_liquidity_to_collateral(&self, liquidity_amount: Decimal) -> Result<Decimal, LendingError> {
+        Ok(liquidity_amount.try_mul(self.0)?) // Uses TryMul<Rate> for Decimal
+    }
+}
+
+// -----------------------------
+// Parameter types
+// -----------------------------
+
+#[odra::odra_type]
+pub struct InitReserveParams {
+    pub current_slot: u64,
+    pub lending_market: [u8; 32],
+    pub liquidity: NewReserveLiquidityParams,
+    pub collateral: NewReserveCollateralParams,
+    pub config: ReserveConfigStorage,
+}
+
+#[odra::odra_type]
+pub struct NewReserveLiquidityParams {
+    pub mint_pubkey: [u8; 32],
+    pub mint_decimals: u8,
+    pub supply_pubkey: [u8; 32],
+    pub fee_receiver: [u8; 32],
+    pub oracle_pubkey: [u8; 32],
+    pub available_amount: u64,
+    // FIXED: Store as tuple instead of Decimal
+    pub borrowed_amount_wads_scaled: (u64, u64),
+    pub cumulative_borrow_rate_wads_scaled: (u64, u64),
+    pub market_price_scaled: (u64, u64),
+}
+
+#[odra::odra_type]
+pub struct NewReserveCollateralParams {
+    pub mint_pubkey: [u8; 32],
+    pub mint_total_supply: u64,
+    pub supply_pubkey: [u8; 32],
+}
+
+// -----------------------------
+// Module definition
+// -----------------------------
+
+#[odra::module]
+pub struct ReserveModule {
+    version: Var<u8>,
+    last_update: Var<LastUpdateStorage>,
+    lending_market: Var<[u8; 32]>,
+    liquidity: Var<ReserveLiquidityStorage>,
+    collateral: Var<ReserveCollateralStorage>,
+    config: Var<ReserveConfigStorage>,
+}
+
+#[odra::module]
+impl ReserveModule {
+    pub fn init(&mut self, params: InitReserveParams) {
+        self.version.set(PROGRAM_VERSION);
+        self.last_update.set(LastUpdateStorage { 
+            slot: params.current_slot, 
+            stale: false 
+        });
+        self.lending_market.set(params.lending_market);
+
+        let mut liq = ReserveLiquidityStorage::default();
+        liq.mint_pubkey = params.liquidity.mint_pubkey;
+        liq.mint_decimals = params.liquidity.mint_decimals;
+        liq.supply_pubkey = params.liquidity.supply_pubkey;
+        liq.fee_receiver = params.liquidity.fee_receiver;
+        liq.oracle_pubkey = params.liquidity.oracle_pubkey;
+        liq.available_amount = params.liquidity.available_amount;
+        // FIXED: Use tuple directly
+        liq.borrowed_amount_wads_scaled = params.liquidity.borrowed_amount_wads_scaled;
+        liq.cumulative_borrow_rate_wads_scaled = params.liquidity.cumulative_borrow_rate_wads_scaled;
+        liq.market_price_scaled = params.liquidity.market_price_scaled;
+        self.liquidity.set(liq);
+
+        let mut coll = ReserveCollateralStorage::default();
+        coll.mint_pubkey = params.collateral.mint_pubkey;
+        coll.mint_total_supply = params.collateral.mint_total_supply;
+        coll.supply_pubkey = params.collateral.supply_pubkey;
+        self.collateral.set(coll);
+
+        let mut cfg = ReserveConfigStorage::default();
+        cfg.optimal_utilization_rate = params.config.optimal_utilization_rate;
+        cfg.loan_to_value_ratio = params.config.loan_to_value_ratio;
+        cfg.liquidation_bonus = params.config.liquidation_bonus;
+        cfg.liquidation_threshold = params.config.liquidation_threshold;
+        cfg.min_borrow_rate = params.config.min_borrow_rate;
+        cfg.optimal_borrow_rate = params.config.optimal_borrow_rate;
+        cfg.max_borrow_rate = params.config.max_borrow_rate;
+        cfg.fees = ReserveFeesStorage { 
+            borrow_fee_wad: params.config.fees.borrow_fee_wad,
+            flash_loan_fee_wad: params.config.fees.flash_loan_fee_wad,
+            host_fee_percentage: params.config.fees.host_fee_percentage,
+        };
+        self.config.set(cfg);
+    }
+
+    pub fn deposit_liquidity(&mut self, liquidity_amount: u64) -> u64 {
+        let mut liq = self.liquidity.get_or_default();
+        let coll = self.collateral.get_or_default();
+
+        let exchange_rate = CollateralExchangeRate::from_storage(&coll, &liq);
+        let collateral_amount = exchange_rate.liquidity_to_collateral(liquidity_amount)
+            .unwrap_or_revert(&self.env());
+
+        liq.available_amount = liq.available_amount
+            .checked_add(liquidity_amount)
+            .unwrap_or_revert(&self.env());
+        self.liquidity.set(liq);
+
+        let mut coll_mut = self.collateral.get_or_default();
+        coll_mut.mint_total_supply = coll_mut.mint_total_supply
+            .checked_add(collateral_amount)
+            .unwrap_or_revert(&self.env());
+        self.collateral.set(coll_mut);
+
+        collateral_amount
+    }
+
+    pub fn redeem_collateral(&mut self, collateral_amount: u64) -> u64 {
+        let mut liq = self.liquidity.get_or_default();
+        let mut coll = self.collateral.get_or_default();
+
+        let exchange_rate = CollateralExchangeRate::from_storage(&coll, &liq);
+        let liquidity_amount = exchange_rate.collateral_to_liquidity(collateral_amount)
+            .unwrap_or_revert(&self.env());
+
+        coll.mint_total_supply = coll.mint_total_supply
+            .checked_sub(collateral_amount)
+            .unwrap_or_revert(&self.env());
+        self.collateral.set(coll.clone());
+
+        if liquidity_amount > liq.available_amount {
+            self.env().revert(LendingError::InsufficientLiquidity);
+        }
+        liq.available_amount = liq.available_amount
+            .checked_sub(liquidity_amount)
+            .unwrap_or_revert(&self.env());
+        self.liquidity.set(liq);
+
+        liquidity_amount
+    }
+
+    // FIXED: Return u64 instead of Rate for entry points
+    pub fn current_borrow_rate(&self) -> u64 {
+        let liq = self.liquidity.get_or_default();
+        let cfg = self.config.get_or_default();
+        let utilization_rate = Self::utilization_rate_storage(&liq)
+            .unwrap_or_revert(&self.env());
+        let optimal_utilization_rate = Rate::from_percent(cfg.optimal_utilization_rate);
+        let low_utilization = utilization_rate < optimal_utilization_rate;
+
+        let rate = if low_utilization || cfg.optimal_utilization_rate == 100 {
+            let normalized_rate = utilization_rate.try_div(optimal_utilization_rate)
+                .unwrap_or_revert(&self.env());
+            let min_rate = Rate::from_percent(cfg.min_borrow_rate);
+            let rate_range = Rate::from_percent(
+                cfg.optimal_borrow_rate
+                    .checked_sub(cfg.min_borrow_rate)
+                    .unwrap_or_revert(&self.env())
+            );
+            normalized_rate.try_mul(rate_range)
+                .and_then(|r| r.try_add(min_rate))
+                .unwrap_or_revert(&self.env())
+        } else {
+            let normalized_rate = utilization_rate
+                .try_sub(optimal_utilization_rate)
+                .and_then(|r| r.try_div(Rate::from_percent(
+                    100u8.checked_sub(cfg.optimal_utilization_rate)
+                        .unwrap_or_revert(&self.env())
+                )))
+                .unwrap_or_revert(&self.env());
+            let optimal_rate = Rate::from_percent(cfg.optimal_borrow_rate);
+            let rate_range = Rate::from_percent(
+                cfg.max_borrow_rate
+                    .checked_sub(cfg.optimal_borrow_rate)
+                    .unwrap_or_revert(&self.env())
+            );
+            normalized_rate.try_mul(rate_range)
+                .and_then(|r| r.try_add(optimal_rate))
+                .unwrap_or_revert(&self.env())
+        };
+        
+        // Convert Rate to scaled u64 for entry point compatibility
+        rate.to_scaled_val() as u64
+    }
+
+    pub fn accrue_interest(&mut self, current_slot: u64) {
+        let mut last = self.last_update.get_or_default();
+        let slots_elapsed = current_slot
+            .checked_sub(last.slot)
+            .unwrap_or_revert(&self.env());
+        
+        if slots_elapsed > 0 {
+            let current_borrow_rate = Rate::from_scaled_val(self.current_borrow_rate() as u128);
+            let mut liq = self.liquidity.get_or_default();
+            Self::compound_interest_storage(&mut liq, current_borrow_rate, slots_elapsed)
+                .unwrap_or_revert(&self.env());
+            self.liquidity.set(liq);
+            last.slot = current_slot;
+            self.last_update.set(last);
+        }
+    }
+
+    // FIXED: Accept tuple instead of Decimal for entry point
+    pub fn calculate_repay(
+        &self, 
+        amount_to_repay: u64, 
+        borrowed_amount_scaled: (u64, u64) // Accept tuple instead of Decimal
+    ) -> CalculateRepayResultStorage {
+        let borrowed_amount = Decimal::from_scaled_val(tuple_to_u128(borrowed_amount_scaled));
+        let settle_amount = if amount_to_repay == u64::MAX { 
+            borrowed_amount 
+        } else { 
+            Decimal::from(amount_to_repay).min(borrowed_amount) 
+        };
+        let repay_amount = settle_amount.try_ceil_u64()
+            .unwrap_or_revert(&self.env());
+        CalculateRepayResultStorage { 
+            settle_amount_scaled: u128_to_tuple(settle_amount.to_scaled_val()), 
+            repay_amount 
+        }
+    }
+
+    // Helper methods
+    fn total_supply_storage(liq: &ReserveLiquidityStorage) -> Result<Decimal, LendingError> {
+        Ok(Decimal::from(liq.available_amount)
+            .try_add(Decimal::from_scaled_val(tuple_to_u128(liq.borrowed_amount_wads_scaled)))?)
+    }
+
+    fn utilization_rate_storage(liq: &ReserveLiquidityStorage) -> Result<Rate, LendingError> {
+        let total_supply = Self::total_supply_storage(liq)?;
+        if total_supply == Decimal::zero() { 
+            return Ok(Rate::zero()); 
+        }
+        let borrowed = liq.borrowed_amount_wads();
+        let utilization = borrowed.try_div(total_supply)?;
+        // FIXED: Use From<Decimal> for Rate instead of TryFrom
+        Ok(Rate::from(utilization))
+    }
+
+    fn compound_interest_storage(
+        liq: &mut ReserveLiquidityStorage, 
+        current_borrow_rate: Rate, 
+        slots_elapsed: u64
+    ) -> Result<(), LendingError> {
+        let slots_per_year_rate = Rate::from_scaled_val(SLOTS_PER_YEAR as u128 * 1_000_000_000_000_000_000);
+        let slot_interest_rate = current_borrow_rate.try_div(slots_per_year_rate)?;
+        let compounded_interest_rate = Rate::one()
+            .try_add(slot_interest_rate)?
+            .try_pow(slots_elapsed)?;
+
+        let mut cumulative = liq.cumulative_borrow_rate_wads();
+        cumulative = cumulative.try_mul(compounded_interest_rate)?; // Uses TryMul<Rate> for Decimal
+        liq.set_cumulative_borrow_rate_wads(cumulative);
+
+        let mut borrowed = liq.borrowed_amount_wads();
+        borrowed = borrowed.try_mul(compounded_interest_rate)?; // Uses TryMul<Rate> for Decimal
+        liq.set_borrowed_amount_wads(borrowed);
+        Ok(())
+    }
+
+    // FIXED: Return tuple instead of Decimal for entry point
+    pub fn get_total_supply(&self) -> (u64, u64) {
+        let liq = self.liquidity.get_or_default();
+        let total_supply = Self::total_supply_storage(&liq)
+            .unwrap_or_revert(&self.env());
+        u128_to_tuple(total_supply.to_scaled_val())
+    }
+
+    // Getters for testing and external access
+    pub fn get_version(&self) -> u8 {
+        self.version.get_or_default()
+    }
+
+    pub fn get_lending_market(&self) -> [u8; 32] {
+        self.lending_market.get_or_default()
+    }
+
+    pub fn get_available_amount(&self) -> u64 {
+        self.liquidity.get_or_default().available_amount
+    }
+}
