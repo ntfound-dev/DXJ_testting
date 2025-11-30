@@ -2,18 +2,18 @@
 //! Original Solana lending program migrated to Odra/Casper
 
 use odra::prelude::*;
-use odra::casper_types::{U256, bytesrepr::{ToBytes, FromBytes}};
-use odra::types::CLTyped;
+use odra::casper_types::U256;
+use odra::casper_types::{U256, CLTyped};
+use odra::prelude::BTreeMap;
+use odra::schema::{CustomType, NamedCLTyped, SchemaCustomTypes};
+use odra::macros::{FromBytes, ToBytes, OdraSchema, CLTyped};
+use crate::math::{TryAdd, TrySub, TryMul, TryDiv};
 
-// Local imports
 use crate::error::LendingError;
-use crate::math::{Decimal, Rate, common::{TryAdd, TrySub, TryMul, TryDiv}};
-
-// Import the math traits
-use crate::math::TryAdd as MathTryAdd;
-use crate::math::TrySub as MathTrySub;
-use crate::math::TryMul as MathTryMul;
-use crate::math::TryDiv as MathTryDiv;
+use crate::math::{
+    common::{TryAdd, TryDiv, TryMul, TrySub},
+    Decimal, Rate
+};
 
 #[odra::module]
 pub struct NovaLending {
@@ -651,21 +651,21 @@ impl NovaLending {
     fn generate_reserve_key(&self) -> Address {
         // Generate a unique key for each reserve
         let count = self.reserve_count.get().unwrap_or(0);
-        let mut data = self.env().self_address().as_bytes().to_vec();
+        let mut data = self.env().self_address().to_bytes().unwrap().to_vec();
         data.extend_from_slice(&count.to_le_bytes());
-        
+
         // Use hash to create deterministic address
-        let hash = self.env().hash(data);
-        Address::from(hash)
+        let hash = self.env().hash(&data);
+        Address::from_bytes(&hash).unwrap()
     }
-    
+
     fn generate_temp_address(&self) -> Address {
         // Generate temporary address for mock data
-        let mut data = self.env().self_address().as_bytes().to_vec();
+        let mut data = self.env().self_address().to_bytes().unwrap().to_vec();
         data.extend_from_slice(&self.env().get_block_time().to_le_bytes());
-        
-        let hash = self.env().hash(data);
-        Address::from(hash)
+
+        let hash = self.env().hash(&data);
+        Address::from_bytes(&hash).unwrap()
     }
     
     fn get_oracle_price(&self) -> Result<Decimal, LendingError> {
@@ -711,11 +711,11 @@ impl NovaLending {
         if obligation.deposited_value == Decimal::zero() {
             return Err(LendingError::ObligationDepositsZero);
         }
-        
+
         let max_withdraw_value = obligation.max_withdraw_value(Rate::from_percent(
-            reserve.config.loan_to_value_ratio,
+            reserve.config.loan_to_value_ratio
         ))?;
-        
+
         if max_withdraw_value == Decimal::zero() {
             return Err(LendingError::WithdrawTooLarge);
         }
@@ -723,24 +723,26 @@ impl NovaLending {
         let withdraw_amount = if collateral_amount == U256::max_value() {
             let withdraw_value = max_withdraw_value.min(collateral.market_value);
             let withdraw_pct = withdraw_value.try_div(collateral.market_value)?;
-            withdraw_pct
+            (withdraw_pct
                 .try_mul(Decimal::from(collateral.deposited_amount.as_u128()))?
-                .try_floor_u64()?
-                .min(collateral.deposited_amount)
+                .try_floor_u64()?)
+            .min(collateral.deposited_amount.as_u64())
+            .into()
         } else {
             let withdraw_amount = collateral_amount.min(collateral.deposited_amount);
-            let withdraw_pct = Decimal::from(withdraw_amount.as_u128()).try_div(Decimal::from(collateral.deposited_amount.as_u128()))?;
+            let withdraw_pct = Decimal::from(withdraw_amount.as_u128())
+                .try_div(Decimal::from(collateral.deposited_amount.as_u128()))?;
             let withdraw_value = collateral.market_value.try_mul(withdraw_pct)?;
             if withdraw_value > max_withdraw_value {
                 return Err(LendingError::WithdrawTooLarge);
             }
             withdraw_amount
         };
-        
+
         if withdraw_amount == U256::zero() {
             return Err(LendingError::WithdrawTooSmall);
         }
-        
+
         Ok(withdraw_amount)
     }
     
@@ -796,7 +798,7 @@ impl NovaLending {
 // SUPPORTING STRUCTS AND IMPLEMENTATIONS
 // ===========================================================================
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct Reserve {
     pub lending_market: Address,
     pub liquidity: ReserveLiquidity,
@@ -820,28 +822,31 @@ impl Reserve {
     }
     
     pub fn deposit_liquidity(&mut self, amount: U256) -> Result<U256, LendingError> {
-        // Calculate collateral amount based on exchange rate
         let exchange_rate = self.collateral_exchange_rate()?;
-        let collateral_amount = exchange_rate.try_mul(Decimal::from(amount.as_u128()))?.try_floor_u64()?;
-        
+        let collateral_amount = exchange_rate
+            .try_mul(Decimal::from(amount.as_u128()))?
+            .try_floor_u64()?;
+
         self.liquidity.deposit(amount)?;
-        self.collateral.mint(collateral_amount)?;
-        
-        Ok(collateral_amount)
+        self.collateral.mint(collateral_amount.into())?;
+
+        Ok(collateral_amount.into())
     }
     
     pub fn redeem_collateral(&mut self, amount: U256) -> Result<U256, LendingError> {
         let exchange_rate = self.collateral_exchange_rate()?;
-        let liquidity_amount = Decimal::from(amount.as_u128()).try_div(exchange_rate)?.try_floor_u64()?;
-        
-        if liquidity_amount > self.liquidity.available_amount {
+        let liquidity_amount = Decimal::from(amount.as_u128())
+            .try_div(exchange_rate)?
+            .try_floor_u64()?;
+
+        if liquidity_amount > self.liquidity.available_amount.as_u64() {
             return Err(LendingError::InsufficientLiquidity);
         }
-        
+
         self.collateral.burn(amount)?;
-        self.liquidity.withdraw(liquidity_amount)?;
-        
-        Ok(liquidity_amount)
+        self.liquidity.withdraw(liquidity_amount.into())?;
+
+        Ok(liquidity_amount.into())
     }
     
     pub fn accrue_interest(&mut self, _slot: u64) -> Result<(), LendingError> {
@@ -850,39 +855,47 @@ impl Reserve {
         Ok(())
     }
     
-    pub fn calculate_borrow(&self, amount: U256, remaining: Decimal) -> Result<CalculateBorrowResult, LendingError> {
+    pub fn calculate_borrow(
+        &self,
+        amount: U256,
+        remaining: Decimal
+    ) -> Result<CalculateBorrowResult, LendingError> {
         let remaining_u64 = remaining.try_floor_u64()?;
-        let borrow_amount = if amount == U256::max_value() {
-            remaining_u64
+        let borrow_amount: U256 = if amount == U256::max_value() {
+            remaining_u64.into()
         } else {
             U256::min(amount, remaining_u64.into())
         };
-        
+
         let borrow_fee = borrow_amount / 100; // 1% borrow fee
         let host_fee = borrow_fee / 10; // 10% of borrow fee to host
         let receive_amount = borrow_amount - borrow_fee;
-        
+
         Ok(CalculateBorrowResult {
             borrow_amount: Decimal::from(borrow_amount.as_u128()),
             receive_amount,
             borrow_fee,
-            host_fee,
+            host_fee
         })
     }
     
-    pub fn calculate_repay(&self, amount: U256, borrowed: Decimal) -> Result<CalculateRepayResult, LendingError> {
+    pub fn calculate_repay(
+        &self,
+        amount: U256,
+        borrowed: Decimal
+    ) -> Result<CalculateRepayResult, LendingError> {
         let borrowed_u256 = borrowed.try_floor_u64()?;
-        let repay_amount = if amount == U256::max_value() {
-            borrowed_u256
+        let repay_amount: U256 = if amount == U256::max_value() {
+            borrowed_u256.into()
         } else {
             U256::min(amount, borrowed_u256.into())
         };
-        
+
         let settle_amount = Decimal::from(repay_amount.as_u128());
-        
+
         Ok(CalculateRepayResult {
             settle_amount,
-            repay_amount,
+            repay_amount
         })
     }
     
@@ -902,11 +915,11 @@ impl Reserve {
         
         let repay_amount = repay_value.try_floor_u64()?;
         let withdraw_amount = withdraw_value.try_div(collateral.market_value)?.try_floor_u64()?;
-        
+
         Ok(CalculateLiquidationResult {
             settle_amount: repay_value,
-            repay_amount,
-            withdraw_amount,
+            repay_amount: repay_amount.into(),
+            withdraw_amount: withdraw_amount.into()
         })
     }
     
@@ -920,7 +933,7 @@ impl Reserve {
     }
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct Obligation {
     pub lending_market: Address,
     pub owner: Address,
@@ -951,19 +964,26 @@ impl Obligation {
         }
     }
     
-    pub fn find_or_add_collateral_to_deposits(&mut self, reserve: Address) -> Result<&mut Collateral, LendingError> {
-        if let Some(collateral) = self.deposits.iter_mut().find(|c| c.deposit_reserve == reserve) {
-            return Ok(collateral);
+    pub fn find_or_add_collateral_to_deposits(
+        &mut self,
+        reserve: Address
+    ) -> Result<&mut Collateral, LendingError> {
+        let has_collateral = self.deposits
+            .iter_mut()
+            .any(|c| c.deposit_reserve == reserve);
+
+        if !has_collateral {
+            self.deposits.push(Collateral {
+                deposit_reserve: reserve,
+                deposited_amount: U256::zero(),
+                market_value: Decimal::zero()
+            });
         }
-        
-        // Add new collateral
-        self.deposits.push(Collateral {
-            deposit_reserve: reserve,
-            deposited_amount: U256::zero(),
-            market_value: Decimal::zero(),
-        });
-        
-        Ok(self.deposits.last_mut().unwrap())
+
+        Ok(self.deposits
+            .iter_mut()
+            .find(|c| c.deposit_reserve == reserve)
+            .unwrap())
     }
     
     pub fn find_collateral_in_deposits(&self, reserve: Address) -> Result<(Collateral, usize), LendingError> {
@@ -975,20 +995,26 @@ impl Obligation {
         Err(LendingError::ObligationCollateralEmpty)
     }
     
-    pub fn find_or_add_liquidity_to_borrows(&mut self, reserve: Address) -> Result<&mut Liquidity, LendingError> {
-        if let Some(liquidity) = self.borrows.iter_mut().find(|l| l.borrow_reserve == reserve) {
-            return Ok(liquidity);
+    pub fn find_or_add_liquidity_to_borrows(
+        &mut self,
+        reserve: Address
+    ) -> Result<&mut Liquidity, LendingError> {
+        let has_liquidity = self.borrows.iter().any(|l| l.borrow_reserve == reserve);
+
+        if !has_liquidity {
+            // Add new liquidity
+            self.borrows.push(Liquidity {
+                borrow_reserve: reserve,
+                borrowed_amount_wads: Decimal::zero(),
+                market_value: Decimal::zero(),
+                cumulative_borrow_rate_wads: Decimal::one()
+            });
         }
-        
-        // Add new liquidity
-        self.borrows.push(Liquidity {
-            borrow_reserve: reserve,
-            borrowed_amount_wads: Decimal::zero(),
-            market_value: Decimal::zero(),
-            cumulative_borrow_rate_wads: Decimal::one(),
-        });
-        
-        Ok(self.borrows.last_mut().unwrap())
+
+        Ok(self.borrows
+            .iter_mut()
+            .find(|l| l.borrow_reserve == reserve)
+            .unwrap())
     }
     
     pub fn find_liquidity_in_borrows(&self, reserve: Address) -> Result<(Liquidity, usize), LendingError> {
@@ -1075,10 +1101,28 @@ pub struct Collateral {
     pub market_value: Decimal,
 }
 
+impl TryAdd for U256 {
+    fn try_add(self, rhs: Self) -> Result<Self, LendingError> {
+        self.checked_add(rhs).ok_or(LendingError::MathOverflow)
+    }
+}
+
+impl TrySub for U256 {
+    fn try_sub(self, rhs: Self) -> Result<Self, LendingError> {
+        self.checked_sub(rhs).ok_or(LendingError::MathOverflow)
+    }
+}
+
 impl Collateral {
     pub fn deposit(&mut self, amount: U256) -> Result<(), LendingError> {
         self.deposited_amount = self.deposited_amount.try_add(amount)?;
         Ok(())
+    }
+}
+
+impl SchemaCustomTypes for LendingError {
+    fn schema_custom_types() -> BTreeMap<String, odra::schema::casper_contract_schema::CustomType> {
+        BTreeMap::new()
     }
 }
 
@@ -1109,7 +1153,7 @@ impl Liquidity {
 // PARAMETER STRUCTS
 // ===========================================================================
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct InitReserveParams {
     pub current_slot: u64,
     pub lending_market: Address,
@@ -1118,7 +1162,7 @@ pub struct InitReserveParams {
     pub config: ReserveConfig,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct InitObligationParams {
     pub current_slot: u64,
     pub lending_market: Address,
@@ -1127,7 +1171,7 @@ pub struct InitObligationParams {
     pub borrows: Vec<Liquidity>,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct NewReserveLiquidityParams {
     pub mint_pubkey: Address,
     pub mint_decimals: u8,
@@ -1140,14 +1184,14 @@ pub struct NewReserveLiquidityParams {
     pub cumulative_borrow_rate_wads: Decimal,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct NewReserveCollateralParams {
     pub mint_pubkey: Address,
     pub supply_pubkey: Address,
     pub mint_total_supply: U256,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct ReserveConfig {
     pub loan_to_value_ratio: u8,
     pub liquidation_threshold: u8,
@@ -1170,7 +1214,7 @@ impl ReserveConfig {
     }
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct ReserveFees {
     pub borrow_fee_wad: U256,
     pub flash_loan_fee_wad: U256,
@@ -1186,7 +1230,7 @@ impl ReserveFees {
     }
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct ReserveLiquidity {
     pub mint_pubkey: Address,
     pub mint_decimals: u8,
@@ -1228,7 +1272,7 @@ impl ReserveLiquidity {
     }
 
     pub fn borrow(&mut self, amount: Decimal) -> Result<(), LendingError> {
-        let amount_u256 = amount.try_floor_u64()?;
+        let amount_u256: U256 = amount.try_floor_u64()?.into();
         if amount_u256 > self.available_amount {
             return Err(LendingError::InsufficientLiquidity);
         }
@@ -1237,18 +1281,29 @@ impl ReserveLiquidity {
         Ok(())
     }
 
-    pub fn repay(&mut self, repay_amount: U256, settle_amount: Decimal) -> Result<(), LendingError> {
+    pub fn repay(
+        &mut self,
+        repay_amount: U256,
+        settle_amount: Decimal
+    ) -> Result<(), LendingError> {
         self.available_amount = self.available_amount.try_add(repay_amount)?;
         self.borrowed_amount_wads = self.borrowed_amount_wads.try_sub(settle_amount)?;
         Ok(())
     }
 
     pub fn total_supply(&self) -> U256 {
-        self.available_amount + self.borrowed_amount_wads.try_floor_u64().unwrap_or(U256::zero())
+        self.available_amount
+            .try_add(
+                self.borrowed_amount_wads
+                    .try_floor_u64()
+                    .unwrap_or(0)
+                    .into()
+            )
+            .unwrap_or(self.available_amount)
     }
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct ReserveCollateral {
     pub mint_pubkey: Address,
     pub supply_pubkey: Address,
@@ -1282,7 +1337,7 @@ impl ReserveCollateral {
 // RESULT STRUCTS
 // ===========================================================================
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct CalculateBorrowResult {
     pub borrow_amount: Decimal,
     pub receive_amount: U256,
@@ -1290,13 +1345,13 @@ pub struct CalculateBorrowResult {
     pub host_fee: U256,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct CalculateRepayResult {
     pub settle_amount: Decimal,
     pub repay_amount: U256,
 }
 
-#[derive(Debug, Clone, ToBytes, FromBytes, CLTyped)]
+#[derive(OdraSchema, Debug, Clone, ToBytes, FromBytes, CLTyped)]
 pub struct CalculateLiquidationResult {
     pub settle_amount: Decimal,
     pub repay_amount: U256,
